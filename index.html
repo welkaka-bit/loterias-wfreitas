@@ -1822,10 +1822,27 @@ function parseRateioGenerico(lista) {
   }
   return { prem, ganh };
 }
+// Parser do formato oficial da Caixa (também usado pelo espelho guidi.dev.br)
+function parseCaixaOficial(r) {
+  const { prem, ganh } = parseRateioGenerico(r.listaRateioPremio);
+  return {
+    c: r.numero, d: r.dataApuracao, n: (r.listaDezenas || []).map(x => parseInt(x, 10)).sort((a, b) => a - b),
+    g: [ganh[1], ganh[2], ganh[3], ganh[4], ganh[5]], p: [prem[1], prem[2], prem[3], prem[4], prem[5]],
+    ac: r.valorAcumuladoProximoConcurso || 0, ae: !!r.acumulou, es: !!r.concursoEspecial,
+    le: r.nomeMunicipioUFSorteio || '', de: r.dataProximoConcurso || '', ve: r.valorEstimadoProximoConcurso || 0,
+  };
+}
+const CAIXA_API = 'https://servicebus2.caixa.gov.br/portaldeloterias/api/lotofacil';
+const caixaUrl = n => CAIXA_API + (n ? '/' + n : '');
 const FONTES_RESULTADO = [
   {
+    nome: 'Espelho Caixa (guidi.dev.br)',
+    url: n => 'https://api.guidi.dev.br/loteria/lotofacil/' + (n ? n : 'ultimo'),
+    parse: parseCaixaOficial,
+  },
+  {
     nome: 'API pública Loterias Caixa',
-    url: n => 'https://loteriascaixa-api.herokuapp.com/api/lotofacil' + (n ? '/' + n : '/latest'),
+    url: n => 'https://loteriascaixa-api.herokuapp.com/api/lotofacil/' + (n ? n : 'latest'),
     parse: r => {
       const { prem, ganh } = parseRateioGenerico(r.premiacoes);
       return {
@@ -1836,26 +1853,11 @@ const FONTES_RESULTADO = [
       };
     },
   },
-  {
-    nome: 'Portal oficial da Caixa',
-    url: n => 'https://servicebus2.caixa.gov.br/portaldeloterias/api/lotofacil' + (n ? '/' + n : ''),
-    parse: r => {
-      const { prem, ganh } = parseRateioGenerico(r.listaRateioPremio);
-      return {
-        c: r.numero, d: r.dataApuracao, n: (r.listaDezenas || []).map(x => parseInt(x, 10)).sort((a, b) => a - b),
-        g: [ganh[1], ganh[2], ganh[3], ganh[4], ganh[5]], p: [prem[1], prem[2], prem[3], prem[4], prem[5]],
-        ac: r.valorAcumuladoProximoConcurso || 0, ae: !!r.acumulou, es: !!r.concursoEspecial,
-        le: r.nomeMunicipioUFSorteio || '', de: r.dataProximoConcurso || '', ve: r.valorEstimadoProximoConcurso || 0,
-      };
-    },
-  },
-  {
-    nome: 'Portal oficial da Caixa (via proxy)',
-    url: n => 'https://api.allorigins.win/raw?url=' + encodeURIComponent('https://servicebus2.caixa.gov.br/portaldeloterias/api/lotofacil' + (n ? '/' + n : '')),
-    parse: null, // mesmo parse do portal oficial (definido abaixo)
-  },
+  { nome: 'Portal oficial da Caixa', url: n => caixaUrl(n), parse: parseCaixaOficial },
+  { nome: 'Portal oficial (proxy corsproxy)', url: n => 'https://corsproxy.io/?url=' + encodeURIComponent(caixaUrl(n)), parse: parseCaixaOficial },
+  { nome: 'Portal oficial (proxy allorigins)', url: n => 'https://api.allorigins.win/raw?url=' + encodeURIComponent(caixaUrl(n)), parse: parseCaixaOficial },
+  { nome: 'Portal oficial (proxy codetabs)', url: n => 'https://api.codetabs.com/v1/proxy?quest=' + encodeURIComponent(caixaUrl(n)), parse: parseCaixaOficial },
 ];
-FONTES_RESULTADO[2].parse = FONTES_RESULTADO[1].parse;
 
 async function fetchJSON(url, ms) {
   const ctrl = new AbortController();
@@ -1870,31 +1872,46 @@ function resultadoValido(o) {
   return !!(o && Number.isInteger(o.c) && o.c > 0 && o.d && Array.isArray(o.n) && o.n.length === 15 &&
     o.n.every(x => Number.isInteger(x) && x >= 1 && x <= 25) && new Set(o.n).size === 15);
 }
-// Busca um resultado (n = null → último concurso). Tenta as fontes em ordem; devolve {resultado, fonte} ou null.
+// Busca um resultado (n = null → último concurso). Consulta TODAS as fontes em paralelo
+// (uma fonte lenta/fora do ar não trava as outras) e fica com o concurso mais recente. Devolve {resultado, fonte} ou null.
 async function buscarResultadoOnline(n) {
-  for (const f of FONTES_RESULTADO) {
-    try {
-      const bruto = await fetchJSON(f.url(n || null));
-      const o = f.parse(bruto);
-      if (resultadoValido(o)) return { resultado: o, fonte: f.nome };
-    } catch (e) { /* fonte indisponível — tenta a próxima */ }
-  }
-  return null;
+  const tarefas = FONTES_RESULTADO.map(async f => {
+    const bruto = await fetchJSON(f.url(n || null), 7000);
+    const o = f.parse(bruto);
+    if (!resultadoValido(o)) throw new Error('resposta inválida');
+    if (n && o.c !== n) throw new Error('concurso diferente');
+    return { resultado: o, fonte: f.nome };
+  });
+  const rs = (await Promise.allSettled(tarefas)).filter(r => r.status === 'fulfilled').map(r => r.value);
+  if (!rs.length) return null;
+  rs.sort((x, y) => y.resultado.c - x.resultado.c);
+  return rs[0];
 }
 function lerSyncMeta() { try { return JSON.parse(localStorage.getItem(LS_SYNC)) || null; } catch { return null; } }
 function salvarSyncMeta(meta) { try { localStorage.setItem(LS_SYNC, JSON.stringify(meta)); } catch {} }
 
 // Sincronização do último resultado (falha em silêncio quando offline).
+// Traz o "último" e, se a fonte estiver atrasada, tenta também o concurso seguinte ao da base — e assim por diante,
+// recuperando vários concursos de uma vez caso o app tenha ficado dias fechado.
 async function sincronizar() {
   if (!navigator.onLine) return false;
-  const achou = await buscarResultadoOnline(null);
-  salvarSyncMeta({ quando: Date.now(), ok: !!achou, fonte: achou ? achou.fonte : '', ultimo: achou ? achou.resultado.c : 0 });
-  if (!achou) return false;
-  const o = achou.resultado;
-  if (o.c <= HIST[HIST.length - 1].c) return false; // base local já em dia
-  const extras = carregarExtras().filter(e => e.c !== o.c);
-  extras.push(o);
-  salvarExtras(extras);
+  let achou = await buscarResultadoOnline(null);
+  const novos = [];
+  const ultimoLocal = () => Math.max(HIST[HIST.length - 1].c, ...novos.map(x => x.c));
+  if (achou && achou.resultado.c > HIST[HIST.length - 1].c) novos.push(achou.resultado);
+  let ok = !!achou, fonte = achou ? achou.fonte : '';
+  for (let i = 0; i < 15; i++) {
+    const prox = await buscarResultadoOnline(ultimoLocal() + 1);
+    if (!prox) break;
+    ok = true; fonte = fonte || prox.fonte;
+    novos.push(prox.resultado);
+  }
+  const topo = novos.length ? Math.max(...novos.map(x => x.c)) : (achou ? achou.resultado.c : 0);
+  salvarSyncMeta({ quando: Date.now(), ok, fonte, ultimo: topo });
+  if (!novos.length) return false; // base local já em dia (ou sem conexão)
+  const cs = new Set(novos.map(x => x.c));
+  const extras = carregarExtras().filter(e => !cs.has(e.c));
+  salvarExtras(extras.concat(novos));
   return true;
 }
 // Busca um concurso específico (usado na aba Concursos e na conferência dos jogos salvos).
@@ -2814,22 +2831,10 @@ function renderMeus() {
     if (b.disabled) return;
     b.disabled = true;
     b.textContent = 'Sincronizando…';
-    const novo = await sincronizar();
+    const novo = await executarSync(true);
     b.disabled = false;
     b.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-2.64-6.36"/><path d="M21 3v6h-6"/></svg> Sincronizar';
-    if (novo) {
-      mesclarHistorico();
-      STATS = calcularEstatisticas();
-      renderDashboard();
-      renderConcursos();
-      atualizarStatusPill(true);
-      renderMeus();
-      toast('Resultado novo conferido!', 'Concurso ' + HIST[HIST.length - 1].c + ' adicionado — seus jogos foram conferidos com pontos e prêmio.');
-    } else {
-      const m = lerSyncMeta();
-      if (m && m.ok) toast('Base já em dia', 'O concurso ' + HIST[HIST.length - 1].c + ' já é o mais recente da Caixa na base.');
-      else toast('Sem conexão agora', 'Não foi possível falar com a Caixa — seus jogos continuam salvos e conferíveis pelos dados locais.', true);
-    }
+    if (novo) renderMeus();
   });
   document.getElementById('btnExportar').addEventListener('click', () => {
     const txt = MEUS.map(j =>
@@ -3743,24 +3748,81 @@ async function boot() {
   }
 
   // sincronização online (busca o resultado mais recente; falha em silêncio offline)
-  const novo = await sincronizar();
-  if (novo) {
-    sincronizado = true;
-    mesclarHistorico();
-    STATS = calcularEstatisticas();
-    renderDashboard();
-    renderConcursos();
-    atualizarStatusPill(true);
-    const vm = document.getElementById('view-meus');
-    if (vm && !vm.classList.contains('hidden')) renderMeus();
-    toast('Resultados atualizados', 'Concurso ' + HIST[HIST.length - 1].c + ' recebido da Caixa — seus jogos salvos já foram conferidos.');
+  await executarSync(false);
+  iniciarAutoSync();
+}
+
+// ---- Sincronização compartilhada (boot, botão, timer, volta ao app, volta da internet) ----
+let syncEmAndamento = false, autoSyncIniciado = false;
+async function executarSync(manual) {
+  if (syncEmAndamento) return false;
+  syncEmAndamento = true;
+  let novo = false;
+  try {
+    novo = await sincronizar();
+    if (novo) {
+      sincronizado = true;
+      mesclarHistorico();
+      STATS = calcularEstatisticas();
+      renderDashboard();
+      renderConcursos();
+      atualizarStatusPill(true);
+      const vm = document.getElementById('view-meus');
+      if (vm && !vm.classList.contains('hidden')) renderMeus();
+      toast('Resultados atualizados', 'Concurso ' + HIST[HIST.length - 1].c + ' recebido da Caixa — seus jogos salvos já foram conferidos.');
+    } else if (manual) {
+      const m = lerSyncMeta();
+      if (m && m.ok) toast('Base já em dia', 'O concurso ' + HIST[HIST.length - 1].c + ' é o mais recente publicado pela Caixa.');
+      else toast('Sem conexão com a Caixa', 'Nenhuma fonte respondeu agora. Verifique a internet e tente de novo.', true);
+    }
+  } finally { syncEmAndamento = false; }
+  verificarDefasagem();
+  return novo;
+}
+
+// Avisa quando a base está atrás do calendário (sorteio já deveria ter saído e não conseguimos buscar)
+function verificarDefasagem() {
+  let el = document.getElementById('avisoDefasado');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'avisoDefasado';
+    el.style.cssText = 'display:none;margin:0 0 14px;padding:12px 16px;border-radius:12px;border:1px solid var(--gold);background:rgba(251,191,36,.10);color:var(--ink);font-size:.9rem;align-items:center;gap:12px;flex-wrap:wrap';
+    const dc = document.getElementById('dashContent');
+    dc.parentNode.insertBefore(el, dc);
   }
+  let defasada = false;
+  const dp = STATS && STATS.proximo && STATS.proximo.data;
+  const mt = dp && dp.match(/^(\d{2})[/](\d{2})[/](\d{4})$/);
+  if (mt) {
+    const dataProx = new Date(+mt[3], +mt[2] - 1, +mt[1]);
+    const hoje = new Date(); hoje.setHours(0, 0, 0, 0);
+    const meta = lerSyncMeta();
+    defasada = dataProx < hoje && !(meta && meta.ok && Date.now() - meta.quando < 3600000);
+  }
+  if (!defasada) { el.style.display = 'none'; return; }
+  el.innerHTML = '<span>⚠️ <b>Base possivelmente desatualizada.</b> O concurso <b>' + STATS.proximo.numero + '</b> (' + STATS.proximo.data + ') já deveria ter saído, mas não foi possível consultar a Caixa agora.</span>' +
+    '<button class="btn-ghost" id="btnTentarSync">Tentar novamente</button>';
+  el.style.display = 'flex';
+  document.getElementById('btnTentarSync').onclick = async function () { this.disabled = true; this.textContent = 'Buscando…'; await executarSync(true); };
+}
+
+// Mantém tudo em tempo real: reconsulta a cada 5 min, ao voltar para a aba e ao recuperar a internet
+function iniciarAutoSync() {
+  if (autoSyncIniciado) return;
+  autoSyncIniciado = true;
+  setInterval(() => { if (!document.hidden) executarSync(false); }, 5 * 60 * 1000);
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) return;
+    const m = lerSyncMeta();
+    if (!m || Date.now() - m.quando > 2 * 60 * 1000) executarSync(false);
+  });
+  window.addEventListener('online', () => executarSync(false));
 }
 
 document.getElementById('btnRefresh').addEventListener('click', () => {
   const svg = document.querySelector('#btnRefresh svg');
   svg.classList.add('spin');
-  boot().finally(() => svg.classList.remove('spin'));
+  boot().then(() => executarSync(true)).finally(() => svg.classList.remove('spin'));
 });
 
 initTema();
