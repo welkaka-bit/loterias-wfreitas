@@ -941,7 +941,7 @@ input{font-family:inherit}
     <!-- ===== HERO ===== -->
     <div class="hero">
       <h1 id="heroTitle">Olá. <span>O sorteio não para.</span></h1>
-      <p>Análise estatística completa, padrões reais dos últimos <b id="heroTotal">…</b> concursos e geração
+      <p>Análise estatística completa, padrões reais dos últimos <b id="heroTotal">…</b> concursos<span id="heroLot"></span> e geração
       inteligente de jogos — tudo em um só lugar, direto no seu navegador.</p>
     </div>
 
@@ -1159,6 +1159,8 @@ input{font-family:inherit}
     </section>
 
     <!-- ===== VIEW: MEUS JOGOS ===== -->
+    <section id="view-loterias" role="tabpanel" class="hidden"><div id="lqRoot"></div></section>
+
     <section id="view-meus" role="tabpanel" class="hidden">
       <div id="meusContent"></div>
     </section>
@@ -3617,7 +3619,7 @@ function initTabs() {
       x.classList.toggle('on', on);
       x.setAttribute('aria-selected', on ? 'true' : 'false');
     });
-    ['dashboard', 'gerador', 'fechamento', 'concursos', 'meus'].forEach(v => {
+    ['dashboard', 'gerador', 'fechamento', 'concursos', 'loterias', 'meus'].forEach(v => {
       document.getElementById('view-' + v).classList.toggle('hidden', v !== t.dataset.tab);
     });
     if (t.dataset.tab === 'meus') renderMeus();
@@ -4051,6 +4053,339 @@ document.addEventListener('DOMContentLoaded', nuvemInit);
 window.addEventListener('online', () => {
   if (NU.fase !== 'ok') { NU.iniciou = false; NU.fase = 'local'; NU.erro = ''; nuvemRender(); setTimeout(nuvemInit, 400); }
 });
+</script>
+<script>
+/* ===== MULTI-LOTERIA: Lotofácil (original) · Mega-Sena · Quina — painel dinâmico por loteria ===== */
+(function () {
+  const LOT = {
+    mega:  { nome: 'Mega-Sena', max: 60, base: 6, opts: [6, 7, 8, 9, 10, 12], odds: 50063860, fmax: 14, gar: [3, 4, 5], garN: { 3: 'terno', 4: 'quadra', 5: 'quina' },
+             faixas: { 6: 'Sena', 5: 'Quina', 4: 'Quadra' }, url: '/api/megasena' },
+    quina: { nome: 'Quina',     max: 80, base: 5, opts: [5, 6, 7, 8, 9, 10],  odds: 24040016, fmax: 14, gar: [2, 3, 4], garN: { 2: 'duque', 3: 'terno', 4: 'quadra' },
+             faixas: { 5: 'Quina', 4: 'Quadra', 3: 'Terno', 2: 'Duque' }, url: '/api/quina' },
+  };
+  const API = 'https://loteriascaixa-api.herokuapp.com';
+  const EST = [
+    ['ensemble', 'Ensemble estatístico', 'Estimador empírico-bayesiano (James-Stein) + momentum EWMA, encolhidos pelo teste χ² de uniformidade; escolhe por aderência estrutural, baixa popularidade e diversificação entre os jogos.'],
+    ['quente', 'Dezenas quentes', 'Prioriza as dezenas mais sorteadas em toda a base.'],
+    ['fria', 'Dezenas frias', 'Prioriza as menos sorteadas — aposta contrária à tendência.'],
+    ['atrasadas', 'Atrasadas', 'Prioriza dezenas com mais concursos sem sair em relação ao intervalo médio.'],
+    ['aleatoria', 'Aleatória filtrada', 'Sorteio uniforme validado só pelos filtros estruturais.'],
+  ];
+  const SUB = [['dash', 'Dashboard'], ['ger', 'Gerador'], ['fech', 'Fechamento'], ['conc', 'Concursos'], ['meus', 'Meus jogos']];
+  const S = { lot: 'lf', sub: 'dash', est: 'ensemble', qtd: { mega: 6, quina: 5 }, jogos: 1, ger: [], fn: { mega: 8, quina: 8 }, fg: { mega: 4, quina: 3 },
+              fsel: { mega: [], quina: [] }, fres: null, cq: '', H: {}, ST: {}, MJ: {}, load: {}, BT: {} };
+  const $ = id => document.getElementById(id), dd = n => String(n).padStart(2, '0');
+  const esc = s => String(s).replace(/[&<>"]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  // ---------- base histórica ----------
+  const cacheGet = id => { try { return JSON.parse(localStorage.getItem('lfe4_hl2_' + id)); } catch (e) { return null; } };
+  async function base(id, forcar) {
+    const c = cacheGet(id);
+    if (c && !S.H[id]) { S.H[id] = c.h; S.ST[id] = stats(id); }
+    if (!forcar && c && Date.now() - c.t < 12 * 3600e3) { if (S.lot === id) draw(); return; }
+    S.load[id] = true; if (S.lot === id) draw();
+    try {
+      const ctrl = new AbortController(), tm = setTimeout(() => ctrl.abort(), 25000);
+      const arr = await (await fetch(API + LOT[id].url, { signal: ctrl.signal, cache: 'no-store' })).json(); clearTimeout(tm);
+      const h = arr.map(x => [x.concurso, (x.dezenas || []).map(v => parseInt(v, 10)).sort((a, b) => a - b), x.data || ''])
+        .filter(x => x[1].length === LOT[id].base).sort((a, b) => a[0] - b[0]);
+      if (h.length < 100) throw 0;
+      S.H[id] = h; S.ST[id] = stats(id);
+      try { localStorage.setItem('lfe4_hl2_' + id, JSON.stringify({ t: Date.now(), h })); } catch (e) {}
+      toast('Base atualizada', LOT[id].nome + ': ' + h.length.toLocaleString('pt-BR') + ' concursos.');
+    } catch (e) { if (!S.H[id]) toast('Sem base online', 'Abra com internet e use "Atualizar base". Gerando só com filtros estruturais.', true); }
+    S.load[id] = false; if (S.lot === id) draw();
+  }
+  // ---------- núcleo estatístico ----------
+  const ncdf = z => { const t = 1 / (1 + .2316419 * Math.abs(z)), d = .3989423 * Math.exp(-z * z / 2); const p = d * t * (.3193815 + t * (-.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274)))); return z > 0 ? 1 - p : p; };
+  const chiP = (c, df) => 1 - ncdf((Math.cbrt(c / df) - (1 - 2 / (9 * df))) / Math.sqrt(2 / (9 * df)));
+  const zBonf = N => { let lo = 1, hi = 8; for (let i = 0; i < 40; i++) { const m = (lo + hi) / 2; 2 * (1 - ncdf(m)) > .05 / N ? lo = m : hi = m; } return hi; };
+  const novoEst = N => ({ T: 0, freq: Array(N + 1).fill(0), ult: Array(N + 1).fill(-1), ew: Array(N + 1).fill(0), ewS: 0 });
+  const DEC = Math.pow(.5, 1 / 40);   // meia-vida do EWMA: 40 concursos
+  function passo(st, dz, N, k) { for (let d = 1; d <= N; d++) st.ew[d] *= DEC; st.ewS = st.ewS * DEC + k; dz.forEach(d => { st.freq[d]++; st.ult[d] = st.T; st.ew[d]++; }); st.T++; }
+  function sinal(st, id) {   // χ² de uniformidade (histórico e janela recente) → coeficiente de encolhimento James-Stein (parte positiva)
+    const L = LOT[id], N = L.max, p0 = L.base / N, ewn = st.ewS / L.base, df = N - 1; let c = 0, cr = 0;
+    for (let d = 1; d <= N; d++) { c += (st.freq[d] - st.T * p0) ** 2 / (st.T * p0 * (1 - p0)); cr += (st.ew[d] - ewn * p0) ** 2 / (ewn * p0 * (1 - p0)); }
+    return { chi: c, p: chiP(c, df), s: Math.max(0, 1 - df / c), chiR: cr, pR: chiP(cr, df), sR: Math.max(0, 1 - df / cr) };
+  }
+  function stats(id) {
+    delete S.BT[id];
+    const L = LOT[id], h = S.H[id], N = L.max, st = novoEst(N), pares = Array(L.base + 1).fill(0); let soma = 0;
+    h.forEach(x => { soma += x[1].reduce((a, b) => a + b, 0); pares[x[1].filter(d => d % 2 === 0).length]++; passo(st, x[1], N, L.base); });
+    st.ultimo = h[h.length - 1]; st.somaM = soma / st.T; st.pares = pares; st.p0 = L.base / N; st.sig = sinal(st, id); return st;
+  }
+  function wts(st, id, est, sg) {
+    const L = LOT[id], N = L.max, p0 = L.base / N, w = new Map(), ewn = st.ewS / L.base; sg = sg || sinal(st, id); const sA = Math.max(sg.s, sg.sR);
+    for (let d = 1; d <= N; d++) {
+      const raw = st.freq[d] / st.T / p0, rz = (st.T - 1 - st.ult[d]) * p0; let v;
+      if (est === 'aleatoria') v = 1;
+      else if (est === 'quente') v = raw ** 3;
+      else if (est === 'fria') v = (1 / Math.max(.2, raw)) ** 3;
+      else if (est === 'atrasadas') v = 1 + Math.min(3, rz * .9);
+      else v = Math.max(.3, 1 + sg.s * (raw - 1)) * Math.max(.3, 1 + sg.sR * (st.ew[d] / ewn / p0 - 1)) ** .85 * (1 + sA * Math.min(1.5, rz * .32));
+      w.set(d, Math.max(.02, v));
+    }
+    return w;
+  }
+  function backtest(id) {   // walk-forward: em cada concurso usa só o passado, monta o jogo de maior peso e compara os acertos com o esperado ao acaso
+    const L = LOT[id], N = L.max, k = L.base, h = S.H[id], T = h.length, W = Math.min(1000, T - 250), st = novoEst(N), ests = ['ensemble', 'quente', 'fria', 'atrasadas'], tot = {};
+    ests.forEach(e => tot[e] = 0);
+    h.forEach((x, i) => {
+      if (i >= T - W) { const sg = sinal(st, id); ests.forEach(e => { const top = [...wts(st, id, e, sg)].sort((a, b) => b[1] - a[1] || a[0] - b[0]).slice(0, k).map(q => q[0]); tot[e] += top.filter(d => x[1].includes(d)).length; }); }
+      passo(st, x[1], N, k);
+    });
+    const E = k * k / N, v = k * (k / N) * (1 - k / N) * (N - k) / (N - 1);
+    return { W, E, r: ests.map(e => { const m = tot[e] / W, z = (m - E) / Math.sqrt(v / W); return { e, m, z, p: 2 * (1 - ncdf(Math.abs(z))) }; }) };
+  }
+  const pesos = (id, est) => { const N = LOT[id].max, st = S.ST[id]; return st ? wts(st, id, est, st.sig) : new Map(Array.from({ length: N }, (_, i) => [i + 1, 1])); };
+
+  // ---------- motor de geração ----------
+  function sortear(w, q) {
+    const pool = new Map(w), r = [];
+    while (r.length < q) {
+      const it = [...pool], tot = it.reduce((a, p) => a + p[1], 0); let x = Math.random() * tot, e = it[0][0];
+      for (const [d, v] of it) { x -= v; if (x <= 0) { e = d; break; } }
+      r.push(e); pool.delete(e);
+    }
+    return r.sort((a, b) => a - b);
+  }
+  function metricas(dz, id) {
+    const N = LOT[id].max, k = dz.length; let run = 1, mr = 1, pg = true;
+    for (let i = 1; i < k; i++) { run = dz[i] === dz[i - 1] + 1 ? run + 1 : 1; mr = Math.max(mr, run); }
+    for (let i = 2; i < k; i++) if (dz[i] - dz[i - 1] !== dz[1] - dz[0]) pg = false;
+    const st = S.ST[id], ul = st ? new Set(st.ultimo[1]) : new Set();
+    return { soma: dz.reduce((a, b) => a + b, 0), pares: dz.filter(d => d % 2 === 0).length, mr, pg, dec: new Set(dz.map(d => Math.floor((d - 1) / 10))).size,
+      baixas: dz.filter(d => d <= 31).length, rep: dz.filter(d => ul.has(d)).length, mu: k * (N + 1) / 2, sd: Math.sqrt(k * (N + 1) * (N - k) / 12) };
+  }
+  const passa = (m, k, id) => Math.abs(m.soma - m.mu) / m.sd <= 1.7 && m.pares >= Math.floor(k * .3) && m.pares <= Math.ceil(k * .7) &&
+    m.mr <= (k <= 8 ? 2 : 3) && !m.pg && m.dec >= Math.min(k, id === 'mega' ? 4 : 3) && m.rep <= Math.max(1, Math.round(k / 4));
+  const pontuar = (m, k) => Math.round(Math.max(20, Math.min(99, 100 - Math.abs(m.soma - m.mu) / m.sd * 14 - Math.abs(m.pares - k / 2) * 6 - (m.mr - 1) * 8 - Math.max(0, m.rep - 1) * 6)));
+  const disputa = p => p < 25 ? 'baixa' : p < 50 ? 'média' : 'alta';
+  function popular(dz, id, m) {   // índice 0–100 de quão "popular" é o jogo entre apostadores (aniversários, sequências, padrões visuais)
+    const N = LOT[id].max, k = dz.length, bd = 31 / N; let p = Math.max(0, m.baixas / k - bd) / (1 - bd) * 45 + (m.mr - 1) * 14 + (m.pg ? 25 : 0);
+    const lin = {}, ud = {}; dz.forEach(d => { const r = Math.floor((d - 1) / 10); lin[r] = (lin[r] || 0) + 1; ud[d % 10] = (ud[d % 10] || 0) + 1; });
+    if (Math.max(...Object.values(lin)) >= Math.ceil(k * .7)) p += 10; if (Math.max(...Object.values(ud)) >= 3) p += 8;
+    return Math.round(Math.min(100, p));
+  }
+  function gerar(id, k, n, est) {   // pool filtrado → seleção gulosa por utilidade (aderência − popularidade) com penalidade de sobreposição entre jogos
+    const w = pesos(id, est), pool = [], vistos = new Set(), alvo = Math.max(150, n * 40); let t = 0;
+    while (pool.length < alvo && t++ < 9000) {
+      const dz = sortear(w, k), ch = dz.join('-'); if (vistos.has(ch)) continue;
+      const m = metricas(dz, id); if (!passa(m, k, id) && t < 8000) continue;
+      vistos.add(ch); const pop = popular(dz, id, m), score = pontuar(m, k); pool.push({ dz, m, score, pop, disp: disputa(pop), u: score - .6 * pop });
+    }
+    const out = [];
+    while (out.length < n && pool.length) {
+      let bi = 0, bv = -1e9;
+      pool.forEach((c, i) => { const ov = out.length ? Math.max(...out.map(o => o.dz.filter(d => c.dz.includes(d)).length)) / k : 0, v = c.u - 35 * ov; if (v > bv) { bv = v; bi = i; } });
+      out.push(pool.splice(bi, 1)[0]);
+    }
+    return out;
+  }
+  const comb = (n, r) => { let x = 1; for (let i = 1; i <= r; i++) x = x * (n - r + i) / i; return Math.round(x); };
+
+  // ---------- fechamento (cobertura gulosa): garante t acertos se as k sorteadas estiverem entre as n escolhidas ----------
+  function fechar(id, dz, t) {
+    const n = dz.length, k = LOT[id].base, pc = m => { let c = 0; while (m) { m &= m - 1; c++; } return c; };
+    const cand = [], subs = new Map();
+    for (let m = 0; m < 1 << n; m++) { const c = pc(m); if (c === k) cand.push(m); else if (c === t) subs.set(m, false); }
+    const cov = cand.map(m => { const l = []; for (let s = m; s; s = (s - 1) & m) if (pc(s) === t) l.push(s); return l; });
+    let falta = subs.size; const esc = [];
+    while (falta > 0) {
+      let bi = -1, bg = -1;
+      for (let i = 0; i < cand.length; i++) { let g = 0; for (const s of cov[i]) if (!subs.get(s)) g++; if (g > bg || (g === bg && Math.random() < .3)) { bg = g; bi = i; } }
+      cov[bi].forEach(s => { if (!subs.get(s)) { subs.set(s, true); falta--; } }); esc.push(cand[bi]);
+    }
+    return esc.map(m => dz.filter((_, i) => m >> i & 1)).sort((a, b) => a.join() < b.join() ? -1 : 1);
+  }
+
+  // ---------- Meus jogos ----------
+  const mjGet = id => { if (!S.MJ[id]) { try { S.MJ[id] = JSON.parse(localStorage.getItem('lfe4_mj2_' + id)) || []; } catch (e) { S.MJ[id] = []; } } return S.MJ[id]; };
+  const mjSet = id => { try { localStorage.setItem('lfe4_mj2_' + id, JSON.stringify(S.MJ[id])); } catch (e) {} };
+  function mjAdd(id, jogos, origem) {
+    const l = mjGet(id); let n = 0;
+    jogos.forEach(dz => { if (!l.some(j => j.dz.join() === dz.join())) { l.push({ dz, em: Date.now(), o: origem }); n++; } });
+    mjSet(id); toast(n + ' jogo(s) salvo(s)', LOT[id].nome + ' · veja em "Meus jogos".');
+  }
+  function conferir(id, dz) {
+    const st = S.ST[id]; if (!st) return null; const set = new Set(dz); let best = { h: 0, c: 0 };
+    S.H[id].forEach(x => { const h = x[1].filter(d => set.has(d)).length; if (h > best.h) best = { h, c: x[0] }; });
+    return { ult: st.ultimo[1].filter(d => set.has(d)).length, best };
+  }
+
+  // ---------- renderização ----------
+  const bolas = (dz, hit, sz) => '<div style="display:flex;flex-wrap:wrap;gap:5px">' + dz.map(d => '<div class="bola sm ' + (hit && hit.has(d) ? 'hit' : 'on') + '" style="width:' + (sz || 32) + 'px">' + dd(d) + '</div>').join('') + '</div>';
+  function volante(dz, id, clk) {
+    const set = new Set(dz); let s = '<div style="display:grid;grid-template-columns:repeat(10,1fr);gap:4px;max-width:360px">';
+    for (let d = 1; d <= LOT[id].max; d++) s += '<div class="bola xs ' + (set.has(d) ? 'on' : 'off') + '"' + (clk ? ' data-act="tg" data-d="' + d + '" style="cursor:pointer"' : '') + '>' + dd(d) + '</div>';
+    return s + '</div>';
+  }
+  const seg = (arr, on, act) => '<div class="seg">' + arr.map(a => '<button data-act="' + act + '" data-v="' + a[0] + '"' + (a[0] == on ? ' class="on"' : '') + '>' + a[1] + '</button>').join('') + '</div>';
+  const card = (t, sub, corpo) => '<div class="card card-pad rise" style="margin-bottom:16px"><h3 style="font-size:15px;font-weight:800">' + t + '</h3>' + (sub ? '<p style="font-size:11px;color:var(--dim);margin:2px 0 12px">' + sub + '</p>' : '<div style="height:10px"></div>') + corpo + '</div>';
+  const chips = (arr, cls) => '<div style="display:flex;flex-wrap:wrap;gap:6px">' + arr.map(x => '<span class="chip ' + cls + '">' + x + '</span>').join('') + '</div>';
+  const vazio = id => card('Base histórica indisponível', '', '<p style="font-size:12px;color:var(--muted);line-height:1.6">' + (S.load[id] ? 'Baixando concursos…' : 'Abra o arquivo com internet e toque em <b>Atualizar base online</b> (Dashboard). O Gerador e o Fechamento funcionam sem base, só com filtros estruturais.') + '</p>');
+
+  function vDash(id) {
+    const L = LOT[id], st = S.ST[id]; if (!st) return vazio(id);
+    const N = L.max, idx = Array.from({ length: N }, (_, i) => i + 1), fr = d => st.freq[d], at = d => st.T - 1 - st.ult[d];
+    const q = [...idx].sort((a, b) => fr(b) - fr(a)).slice(0, 10), f = [...idx].sort((a, b) => fr(a) - fr(b)).slice(0, 10), a = [...idx].sort((x, y) => at(y) - at(x)).slice(0, 10);
+    const mx = Math.max(...idx.map(fr)), med = st.T * st.p0;
+    const bars = '<div style="display:flex;align-items:flex-end;gap:2px;height:110px">' + idx.map(d => '<div title="' + dd(d) + ': ' + fr(d) + 'x" style="flex:1;min-width:2px;height:' + Math.max(3, fr(d) / mx * 100) + '%;border-radius:3px 3px 0 0;background:' + (fr(d) >= med ? 'linear-gradient(180deg,#4ade80,#16a34a)' : 'rgba(34,197,94,.35)') + '"></div>').join('') + '</div>';
+    const pm = Math.max(...st.pares), pb = '<div style="display:flex;align-items:flex-end;gap:8px;height:90px">' + st.pares.map((v, i) => '<div style="flex:1;text-align:center;font-size:10px;color:var(--dim)"><div style="height:' + Math.max(3, v / pm * 70) + 'px;border-radius:4px;background:rgba(251,191,36,.6);margin-bottom:3px"></div>' + i + 'P</div>').join('') + '</div>';
+    const u = st.ultimo;
+    return '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:12px;margin-bottom:16px">' +
+      [['Concursos', st.T.toLocaleString('pt-BR')], ['Último', u[0]], ['Soma média', st.somaM.toFixed(1)], ['Sorteio', 'C(' + N + ',' + L.base + ')']].map(k => '<div class="card card-pad"><div class="lbl-campo" style="margin:0 0 4px">' + k[0] + '</div><b style="font-size:22px">' + k[1] + '</b></div>').join('') + '</div>' +
+      card('Último concurso ' + u[0], u[2], bolas(u[1], null, 38)) +
+      card('Frequência de cada dezena', 'Média esperada: ' + med.toFixed(0) + ' saídas · verde forte = acima da média', bars) +
+      '<div class="gen-grid" style="grid-template-columns:repeat(auto-fit,minmax(260px,1fr))">' +
+      card('🔥 Mais sorteadas', '', chips(q.map(d => dd(d) + ' · ' + fr(d) + 'x'), 'gold')) +
+      card('❄️ Menos sorteadas', '', chips(f.map(d => dd(d) + ' · ' + fr(d) + 'x'), 'teal')) +
+      card('⏳ Mais atrasadas', 'Concursos sem sair', chips(a.map(d => dd(d) + ' · ' + at(d)), 'red')) + '</div>' +
+      card('Distribuição pares × ímpares', 'Quantidade de dezenas pares por concurso', pb) + cardRaioX(id);
+  }
+  function cardRaioX(id) {
+    const st = S.ST[id], g = st.sig, L = LOT[id], N = L.max, p0 = L.base / N, bt = S.BT[id] || (S.BT[id] = backtest(id)), zb = zBonf(N);
+    const ext = Array.from({ length: N }, (_, i) => i + 1).map(d => ({ d, z: (st.freq[d] - st.T * p0) / Math.sqrt(st.T * p0 * (1 - p0)) })).filter(x => Math.abs(x.z) > zb);
+    const nm = { ensemble: 'Ensemble', quente: 'Quentes', fria: 'Frias', atrasadas: 'Atrasadas' };
+    const ver = g.p > .05 ? 'Os resultados são compatíveis com um sorteio uniforme (p = ' + g.p.toFixed(3) + '). Pelo estimador de James-Stein, ' + Math.round(g.s * 100) + '% das diferenças observadas entre dezenas são sinal — o resto é ruído.' : 'Há desvio detectável da uniformidade (p = ' + g.p.toFixed(4) + '); o Ensemble usa ' + Math.round(g.s * 100) + '% do desvio observado.';
+    return card('Raio-X estatístico e validação', 'Testes sobre ' + st.T.toLocaleString('pt-BR') + ' concursos · backtest walk-forward nos últimos ' + bt.W,
+      '<p style="font-size:12.5px;line-height:1.6;color:var(--muted);margin-bottom:12px">' + ver + '</p>' +
+      chips(['χ² histórico p=' + g.p.toFixed(3), 'χ² recente p=' + g.pR.toFixed(3), 'Bonferroni |z|>' + zb.toFixed(2) + ': ' + (ext.length ? ext.map(x => dd(x.d) + ' (z=' + x.z.toFixed(1) + ')').join(', ') : 'nenhuma dezena')], 'dim') +
+      '<div class="lbl-campo">Backtest: jogo de maior peso de cada estratégia × acaso (esperado ' + bt.E.toFixed(3) + ' acertos)</div>' +
+      bt.r.map(r => '<div style="display:flex;justify-content:space-between;gap:8px;padding:7px 0;border-top:1px solid var(--line);font-size:12.5px;font-variant-numeric:tabular-nums"><b>' + nm[r.e] + '</b><span>' + r.m.toFixed(3) + ' acertos · z=' + r.z.toFixed(2) + ' · p=' + r.p.toFixed(3) + '</span><span class="chip ' + (r.p < .05 ? 'gold' : 'dim') + '">' + (r.p < .05 ? (r.z > 0 ? 'acima do acaso' : 'abaixo do acaso') : 'sem vantagem') + '</span></div>').join('') +
+      '<p style="font-size:10.5px;color:var(--dim);margin-top:10px;line-height:1.5">Se nenhuma estratégia supera o acaso, a vantagem real do gerador está em evitar combinações populares (dividir menos prêmio) e diversificar os jogos — não em prever dezenas.</p>');
+  }
+  function sinalInfo(id) { const st = S.ST[id]; if (!st) return ''; const g = st.sig; return '<p style="font-size:10.5px;color:var(--muted);margin-top:8px;line-height:1.5">📊 χ² p=' + g.p.toFixed(3) + ' · encolhimento ' + Math.round(g.s * 100) + '% — ' + (g.p > .05 ? 'sem viés detectável: o Ensemble reduz o peso das tendências e foca em filtros, baixa popularidade e diversificação.' : 'desvio detectável: o Ensemble aumenta o peso das tendências.') + '</p>'; }
+  function vGer(id) {
+    const L = LOT[id], k = S.qtd[id], c = comb(k, L.base);
+    const form = card('Gerador inteligente', S.ST[id] ? 'Base: ' + S.ST[id].T.toLocaleString('pt-BR') + ' concursos' : 'Sem base — filtros estruturais',
+      '<div class="lbl-campo" style="margin-top:0">Estratégia</div><div class="estrategias">' + EST.map(e => '<button class="est-btn' + (e[0] === S.est ? ' on' : '') + '" data-act="est" data-v="' + e[0] + '"><span>' + e[1] + '</span></button>').join('') + '</div>' +
+      '<div class="est-desc"><p>' + EST.find(e => e[0] === S.est)[2] + '</p></div>' + sinalInfo(id) +
+      '<div class="lbl-campo">Quantidade de dezenas</div>' + seg(L.opts.map(n => [n, n]), k, 'qtd') +
+      '<p style="font-size:10.5px;color:var(--dim);margin-top:8px;line-height:1.5">' + k + ' dezenas = ' + c + ' aposta' + (c > 1 ? 's' : '') + ' simples · chance do prêmio máximo: 1 em ' + Math.round(L.odds / c).toLocaleString('pt-BR') + '</p>' +
+      '<div class="lbl-campo">Quantidade de jogos</div><div class="stepper"><button class="btn-ghost step-btn" data-act="jm" style="width:40px">−</button><div class="st-val"><b>' + S.jogos + '</b><span>' + (S.jogos === 1 ? 'jogo' : 'jogos') + '</span></div><button class="btn-ghost step-btn" data-act="jp" style="width:40px">+</button></div>' +
+      '<button class="btn" data-act="gerar" style="width:100%;margin-top:18px"><span>Gerar jogos</span></button>' +
+      '<p style="font-size:9.5px;color:var(--dim);text-align:center;margin-top:10px;line-height:1.5">Todo sorteio é aleatório e independente: nenhuma estratégia muda a chance de acerto. Os filtros evitam combinações improváveis e reduzem a divisão de prêmio.</p>');
+    const lista = S.ger.length && S.ger[0].id === id ? '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px"><span class="chip teal">' + S.ger.length + ' jogo(s) cobrem ' + new Set(S.ger.flatMap(j => j.dz)).size + ' dezenas distintas</span><button class="btn-ghost" data-act="salvarTodos">Salvar todos em Meus jogos</button></div>' + S.ger.map((j, i) =>
+      '<div class="card card-pad rise" style="margin-bottom:16px"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px"><b>Jogo ' + (i + 1) + ' · ' + L.nome + '</b><span><button class="btn-ghost" data-act="cp" data-i="' + i + '">Copiar</button> <button class="btn-ghost" data-act="sv" data-i="' + i + '">Salvar</button></span></div>' +
+      volante(j.dz, id) + '<p class="dz-linha" style="margin:12px 0 8px">' + j.dz.map(dd).join(' ') + '</p>' +
+      '<div class="jogo-chips"><span class="chip dim">Soma ' + j.m.soma + '</span><span class="chip dim">' + j.m.pares + 'P / ' + (j.dz.length - j.m.pares) + 'Í</span>' + (S.ST[id] ? '<span class="chip gold">' + j.m.rep + ' rep. do último</span>' : '') +
+      '<span class="chip ' + (j.disp === 'baixa' ? 'teal' : j.disp === 'média' ? 'dim' : 'red') + '">Popularidade ' + j.pop + ' · ' + j.disp + '</span><span class="chip">Aderência ' + j.score + '</span></div></div>').join('')
+      : '<div class="card card-pad empty-state"><h3>Nenhum jogo gerado ainda</h3><p>Escolha a estratégia e clique em <b>Gerar jogos</b>.</p></div>';
+    return '<div class="gen-grid"><div>' + form + '</div><div>' + lista + '</div></div>';
+  }
+  function vFech(id) {
+    const L = LOT[id], sel = S.fsel[id], n = sel.length, t = S.fg[id];
+    const form = card('Fechamento ' + L.nome, 'Escolha de ' + L.base + ' a ' + L.fmax + ' dezenas. O sistema monta o menor conjunto de jogos que <b>garante</b> o acerto escolhido se as ' + L.base + ' sorteadas estiverem entre as suas.',
+      '<div class="lbl-campo" style="margin-top:0">Toque para marcar as dezenas (' + n + ' selecionadas)</div>' + volante(sel, id, true) +
+      '<div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap"><button class="btn-ghost" data-act="fsug">Sugerir com a estratégia</button><button class="btn-ghost" data-act="flim">Limpar</button></div>' +
+      '<div class="lbl-campo">Garantia</div>' + seg(L.gar.map(g => [g, L.garN[g]]), t, 'fg') +
+      '<button class="btn" data-act="fgerar" style="width:100%;margin-top:16px"' + (n < L.base + 1 || n > L.fmax ? ' disabled' : '') + '><span>Gerar fechamento</span></button>' +
+      '<p style="font-size:10px;color:var(--dim);margin-top:8px;line-height:1.5">Mínimo ' + (L.base + 1) + ' e máximo ' + L.fmax + ' dezenas. Fechamento completo teria ' + (n >= L.base ? comb(n, L.base) : '—') + ' jogos.</p>');
+    let res = '';
+    if (S.fres && S.fres.id === id) {
+      const r = S.fres; res = card(r.jogos.length + ' jogos · garantia de ' + L.garN[r.t], 'Redução de ' + comb(r.dz.length, L.base) + ' para ' + r.jogos.length + ' jogos (' + Math.round(100 - r.jogos.length / comb(r.dz.length, L.base) * 100) + '% menos)',
+        '<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap"><button class="btn-ghost" data-act="fcp">Copiar todos</button><button class="btn-ghost" data-act="fsv">Salvar todos em Meus jogos</button></div>' +
+        '<div style="max-height:520px;overflow:auto;display:flex;flex-direction:column;gap:6px">' + r.jogos.map((j, i) => '<div class="fc-tab-row" style="display:flex;gap:10px;align-items:center;font-size:13px;font-variant-numeric:tabular-nums"><span style="color:var(--dim);width:30px">' + (i + 1) + '</span><b>' + j.map(dd).join(' ') + '</b></div>').join('') + '</div>');
+    }
+    return '<div class="gen-grid"><div>' + form + '</div><div>' + (res || '<div class="card card-pad empty-state"><h3>Nenhum fechamento gerado</h3><p>Marque suas dezenas e escolha a garantia.</p></div>') + '</div></div>';
+  }
+  function vConc(id) {
+    const st = S.ST[id]; if (!st) return vazio(id);
+    const q = parseInt(S.cq, 10), h = S.H[id], lista = q ? h.filter(x => x[0] === q) : h.slice(-20).reverse();
+    return card('Concursos ' + LOT[id].nome, 'Busque pelo número ou veja os 20 mais recentes',
+      '<div style="display:flex;gap:8px;margin-bottom:14px"><input id="lqBusca" type="number" placeholder="Nº do concurso" value="' + esc(S.cq) + '" style="flex:1;padding:10px 12px;border-radius:12px;border:1px solid var(--line);background:var(--panel);color:var(--ink)"><button class="btn" data-act="busca"><span>Buscar</span></button></div>' +
+      (lista.length ? lista.map(x => '<div style="display:flex;gap:14px;align-items:center;flex-wrap:wrap;padding:10px 0;border-top:1px solid var(--line)"><div style="min-width:90px"><b>' + x[0] + '</b><div style="font-size:10.5px;color:var(--dim)">' + x[2] + '</div></div>' + bolas(x[1], null, 30) + '</div>').join('') : '<p style="color:var(--muted);font-size:13px">Concurso não encontrado.</p>'));
+  }
+  function vMeus(id) {
+    const L = LOT[id], l = mjGet(id), st = S.ST[id], ul = st ? new Set(st.ultimo[1]) : null;
+    const topo = '<div style="display:flex;gap:8px;margin-bottom:14px;flex-wrap:wrap"><button class="btn-ghost" data-act="mcp">Copiar todos</button><button class="btn-ghost" data-act="mclr">Apagar todos</button></div>';
+    if (!l.length) return card('Meus jogos · ' + L.nome, '', '<p style="color:var(--muted);font-size:13px">Nenhum jogo salvo. Gere no <b>Gerador</b> ou no <b>Fechamento</b> e toque em Salvar.</p>');
+    return card('Meus jogos · ' + L.nome, l.length + ' jogo(s) salvo(s)' + (st ? ' · conferidos com o concurso ' + st.ultimo[0] : ''), topo + l.map((j, i) => {
+      const c = conferir(id, j.dz), nm = c && L.faixas[c.ult];
+      return '<div style="padding:12px 0;border-top:1px solid var(--line)"><div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-bottom:8px;flex-wrap:wrap"><span class="chip dim">' + j.dz.length + ' dezenas · ' + (j.o || 'manual') + ' · ' + new Date(j.em).toLocaleDateString('pt-BR') + '</span><button class="btn-ghost" data-act="mdel" data-i="' + i + '">Excluir</button></div>' + bolas(j.dz, ul, 32) +
+        (c ? '<div class="jogo-chips" style="margin-top:8px"><span class="chip ' + (nm ? 'gold' : 'dim') + '">Último: ' + c.ult + ' acerto(s)' + (nm ? ' · ' + nm : '') + '</span><span class="chip teal">Melhor da história: ' + c.best.h + ' (conc. ' + c.best.c + ')</span></div>' : '') + '</div>';
+    }).join(''));
+  }
+
+  function hero() {   // cabeçalho global: total de concursos e nome da loteria acompanham o seletor
+    const t = $('heroTotal'), l = $('heroLot'); if (!t) return;
+    if (S.lot === 'lf') { if (S.lfTotal) t.textContent = S.lfTotal; if (l) l.textContent = ''; return; }
+    const st = S.ST[S.lot], v = st ? st.T.toLocaleString('pt-BR') : '…';
+    if (S.lfTotal === undefined && t.textContent !== v && t.textContent !== '…') S.lfTotal = t.textContent;
+    if (t.textContent !== v) t.textContent = v; if (l) l.textContent = ' da ' + LOT[S.lot].nome;
+  }
+  function draw() {
+    hero(); const root = $('lqRoot'); if (!root || S.lot === 'lf') return; const id = S.lot, L = LOT[id];
+    const tit = SUB.find(x => x[0] === S.sub)[1];
+    const nav = '<div style="display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:16px"><h2 style="font-size:20px;font-weight:800">' + L.nome + ' <span style="color:var(--gold)">· ' + tit + '</span></h2>' +
+      '<button class="btn-ghost" data-act="atual">' + (S.load[id] ? 'Atualizando…' : 'Atualizar base online') + '</button></div>';
+    root.innerHTML = nav + ({ dash: vDash, ger: vGer, fech: vFech, conc: vConc, meus: vMeus }[S.sub])(id);
+  }
+
+  // ---------- eventos ----------
+  function onClick(e) {
+    const b = e.target.closest('[data-act]'); if (!b) return; const id = S.lot, L = LOT[id], v = b.dataset.v, a = b.dataset.act, i = +b.dataset.i;
+    if (a === 'sub') S.sub = v;
+    else if (a === 'atual') { base(id, true); return; }
+    else if (a === 'est') S.est = v;
+    else if (a === 'qtd') S.qtd[id] = +v;
+    else if (a === 'jm') S.jogos = Math.max(1, S.jogos - 1);
+    else if (a === 'jp') S.jogos = Math.min(10, S.jogos + 1);
+    else if (a === 'gerar') { S.ger = gerar(id, S.qtd[id], S.jogos, S.est).map(j => (j.id = id, j)); toast(S.ger.length + ' jogo(s) gerado(s)', L.nome); }
+    else if (a === 'cp') { copiarTexto(S.ger[i].dz.map(dd).join(' ')); toast('Copiado', S.ger[i].dz.map(dd).join(' ')); return; }
+    else if (a === 'sv') { mjAdd(id, [S.ger[i].dz], 'gerador'); return; }
+    else if (a === 'salvarTodos') { mjAdd(id, S.ger.map(j => j.dz), 'gerador'); return; }
+    else if (a === 'tg') { const d = +b.dataset.d, s = S.fsel[id], p = s.indexOf(d); if (p >= 0) s.splice(p, 1); else if (s.length < L.fmax) s.push(d); else toast('Limite', 'Máximo de ' + L.fmax + ' dezenas.', true); s.sort((x, y) => x - y); S.fres = null; }
+    else if (a === 'fsug') { S.fsel[id] = sortear(pesos(id, S.est), Math.min(S.fn[id], L.fmax)); S.fres = null; }
+    else if (a === 'flim') { S.fsel[id] = []; S.fres = null; }
+    else if (a === 'fg') S.fg[id] = +v;
+    else if (a === 'fgerar') { const t0 = S.fg[id]; S.fres = { id, t: t0, dz: S.fsel[id].slice(), jogos: fechar(id, S.fsel[id], t0) }; }
+    else if (a === 'fcp') { copiarTexto(S.fres.jogos.map(j => j.map(dd).join(' ')).join('\n')); toast('Copiado', S.fres.jogos.length + ' jogos.'); return; }
+    else if (a === 'fsv') { mjAdd(id, S.fres.jogos, 'fechamento'); return; }
+    else if (a === 'busca') S.cq = ($('lqBusca') || {}).value || '';
+    else if (a === 'mdel') { mjGet(id).splice(i, 1); mjSet(id); }
+    else if (a === 'mclr') { if (!confirm('Apagar todos os jogos salvos de ' + L.nome + '?')) return; S.MJ[id] = []; mjSet(id); }
+    else if (a === 'mcp') { copiarTexto(mjGet(id).map(j => j.dz.map(dd).join(' ')).join('\n')); toast('Copiado', 'Jogos salvos copiados.'); return; }
+    draw();
+  }
+
+  // ---------- seletor de loteria (sidebar) ----------
+  function setLot(id) {
+    S.lot = id; hero();
+    document.querySelectorAll('#lotSwitch button').forEach(b => b.classList.toggle('on', b.dataset.l === id));
+    document.querySelectorAll('.sb-nav .tab').forEach(t => t.classList.toggle('hidden', t.classList.contains('lq-tab') !== (id !== 'lf')));
+    const alvo = document.querySelector(id === 'lf' ? '.sb-nav .tab[data-tab="dashboard"]' : '.lq-tab[data-sub="' + S.sub + '"]'); if (alvo) alvo.click();
+    if (id !== 'lf') { draw(); base(id); }
+    try { localStorage.setItem('lfe4_lot', id); } catch (e) {}
+  }
+  function iniciar() {
+    const nav = document.querySelector('.sb-nav'); if (!nav || !$('lqRoot')) return;
+    const sw = document.createElement('div'); sw.id = 'lotSwitch'; sw.style.cssText = 'padding:8px 12px 4px';
+    sw.innerHTML = '<div class="seg">' + [['lf', 'Lotofácil'], ['mega', 'Mega'], ['quina', 'Quina']].map(a => '<button data-l="' + a[0] + '" style="font-size:11.5px;padding:7px 0"' + (a[0] === 'lf' ? ' class="on"' : '') + '>' + a[1] + '</button>').join('') + '</div>';
+    nav.parentNode.insertBefore(sw, nav);
+    sw.querySelectorAll('button').forEach(b => b.addEventListener('click', () => setLot(b.dataset.l)));
+    const orig = ['dashboard', 'gerador', 'fechamento', 'concursos', 'meus'], subs = ['dash', 'ger', 'fech', 'conc', 'meus'];
+    orig.forEach((o, k) => {
+      const ref = nav.querySelector('.tab[data-tab="' + o + '"]'); if (!ref) return;
+      const t = ref.cloneNode(true); t.classList.add('lq-tab', 'hidden'); t.classList.remove('on'); t.dataset.tab = 'loterias'; t.dataset.sub = subs[k]; t.setAttribute('aria-selected', 'false');
+      t.querySelectorAll('[id]').forEach(e => e.removeAttribute('id')); const cn = t.querySelector('.cnt'); if (cn) cn.remove();
+      t.addEventListener('click', () => {
+        S.sub = subs[k];
+        nav.querySelectorAll('.tab').forEach(x => { x.classList.toggle('on', x === t); x.setAttribute('aria-selected', x === t ? 'true' : 'false'); });
+        ['dashboard', 'gerador', 'fechamento', 'concursos', 'meus', 'loterias'].forEach(v => { const e = $('view-' + v); if (e) e.classList.toggle('hidden', v !== 'loterias'); });
+        document.documentElement.classList.remove('sb-open'); draw();
+      });
+      nav.appendChild(t);
+    });
+    const ht = $('heroTotal'); if (ht) new MutationObserver(() => { if (S.lot !== 'lf') { const st = S.ST[S.lot], v = st ? st.T.toLocaleString('pt-BR') : '…'; if (ht.textContent !== v) { S.lfTotal = ht.textContent; hero(); } } }).observe(ht, { childList: true, characterData: true, subtree: true });
+    $('lqRoot').addEventListener('click', onClick);
+    $('lqRoot').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'lqBusca') { S.cq = e.target.value; draw(); } });
+    const mini = document.createElement('style'); mini.textContent = 'html[data-sb="mini"] #lotSwitch{display:none}'; document.head.appendChild(mini);
+    try { const s = localStorage.getItem('lfe4_lot'); if (s && s !== 'lf' && LOT[s]) { const go = () => setTimeout(() => setLot(s), 50); document.readyState === 'loading' ? document.addEventListener('DOMContentLoaded', go) : go(); } } catch (e) {}
+  }
+  iniciar();
+})();
 </script>
 </body>
 </html>
