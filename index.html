@@ -1761,6 +1761,8 @@ function gerarJogos(dezenas, jogos, estrategia) {
     const ok = passaFiltros(m);
     const sc = pontuar(m);
     if (!ok && tent < nJ * 600 * 0.6) continue;
+    // diversificação: evita jogos quase idênticos entre si (relaxa após metade das tentativas)
+    if (tent < nJ * 600 * 0.5 && out.some(o => o.dezenas.filter(x => dz.includes(x)).length > Math.ceil(qtd * 0.8))) continue;
     out.push({
       id: Date.now().toString(36) + '-' + Math.random().toString(36).slice(2, 8),
       dezenas: dz,
@@ -4323,6 +4325,32 @@ window.addEventListener('online', () => {
     root.innerHTML = nav + ({ dash: vDash, ger: vGer, fech: vFech, conc: vConc, meus: vMeus }[S.sub])(id);
   }
 
+  // ---------- Lotofácil: backtest walk-forward do motor REAL do app (HIST / STATS / pesosDa originais) ----------
+  let LFBT = null;
+  function lfBacktest() {
+    const orig = HIST, origS = STATS, N = 25, k = 15, ids = ESTRATEGIAS.map(e => e.id), tot = {}; ids.forEach(e => tot[e] = 0);
+    const T = orig.length, W = Math.min(600, T - 300), idx = []; for (let i = T - W; i < T; i += 5) idx.push(i);
+    const t0 = Date.now();
+    try {
+      idx.forEach(i => {   // em cada concurso i, o motor só enxerga os concursos anteriores
+        HIST = orig.slice(0, i); STATS = calcularEstatisticas();
+        ids.forEach(e => { const top = [...pesosDa(e)].sort((a, b) => b[1] - a[1] || a[0] - b[0]).slice(0, k).map(q => q[0]); tot[e] += top.filter(d => orig[i].n.includes(d)).length; });
+      });
+    } finally { HIST = orig; STATS = origS; }
+    const E = k * k / N, v = k * (k / N) * (1 - k / N) * (N - k) / (N - 1), n = idx.length;
+    LFBT = { n, W, E, ms: Date.now() - t0, r: ids.map(e => { const m = tot[e] / n, z = (m - E) / Math.sqrt(v / n); return { nome: ESTRATEGIAS.find(x => x.id === e).nome, m, z, p: 2 * (1 - ncdf(Math.abs(z))) }; }) };
+  }
+  function lfBtRender() {
+    const bx = $('lfBt'); if (!bx) return;
+    const corpo = LFBT
+      ? '<div class="lbl-campo" style="margin-top:0">Jogo de 15 dezenas de maior peso de cada estratégia × acaso (esperado ' + LFBT.E.toFixed(2) + ' acertos)</div>' +
+        LFBT.r.map(r => '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;padding:7px 0;border-top:1px solid var(--line);font-size:12.5px;font-variant-numeric:tabular-nums"><b>' + r.nome + '</b><span>' + r.m.toFixed(3) + ' acertos · z=' + r.z.toFixed(2) + ' · p=' + r.p.toFixed(3) + '</span><span class="chip ' + (r.p < .05 ? 'gold' : 'dim') + '">' + (r.p < .05 ? (r.z > 0 ? 'acima do acaso' : 'abaixo do acaso') : 'sem vantagem') + '</span></div>').join('') +
+        '<p style="font-size:10.5px;color:var(--dim);margin-top:10px;line-height:1.5">' + LFBT.n + ' concursos amostrados (1 a cada 5 nos últimos ' + LFBT.W + '), calculados em ' + (LFBT.ms / 1000).toFixed(1) + 's. Com essa amostra só se detecta vantagem acima de ~0,2 acerto; "sem vantagem" significa que não há evidência de que a estratégia supere o acaso. Com 5 estratégias testadas, um único p&lt;0,05 isolado pode ser coincidência.</p>' +
+        '<button class="btn-ghost" data-act="lfbt" style="margin-top:8px">Rodar novamente</button>'
+      : '<p style="font-size:12.5px;color:var(--muted);line-height:1.6;margin-bottom:12px">Testa o motor real do seu app: em cada concurso do passado, ele só enxerga os concursos anteriores, monta o jogo de maior peso de cada estratégia e compara os acertos com o que o acaso daria. Leva alguns segundos.</p><button class="btn" data-act="lfbt"><span>Rodar backtest do motor</span></button>';
+    bx.innerHTML = card('Validação do motor · backtest walk-forward', 'Lotofácil · as estratégias superam o acaso?', corpo);
+  }
+
   // ---------- eventos ----------
   function onClick(e) {
     const b = e.target.closest('[data-act]'); if (!b) return; const id = S.lot, L = LOT[id], v = b.dataset.v, a = b.dataset.act, i = +b.dataset.i;
@@ -4379,6 +4407,10 @@ window.addEventListener('online', () => {
       nav.appendChild(t);
     });
     const ht = $('heroTotal'); if (ht) new MutationObserver(() => { if (S.lot !== 'lf') { const st = S.ST[S.lot], v = st ? st.T.toLocaleString('pt-BR') : '…'; if (ht.textContent !== v) { S.lfTotal = ht.textContent; hero(); } } }).observe(ht, { childList: true, characterData: true, subtree: true });
+    const dc = $('dashContent'); if (dc && typeof pesosDa === 'function') {
+      const bx = document.createElement('div'); bx.id = 'lfBt'; bx.style.marginTop = '20px'; dc.after(bx); lfBtRender();
+      bx.addEventListener('click', e => { if (!e.target.closest('[data-act="lfbt"]')) return; bx.querySelector('[data-act="lfbt"]').textContent = 'Calculando…'; setTimeout(() => { try { lfBacktest(); } catch (er) { toast('Falha no backtest', String(er), true); } lfBtRender(); }, 40); });
+    }
     $('lqRoot').addEventListener('click', onClick);
     $('lqRoot').addEventListener('keydown', e => { if (e.key === 'Enter' && e.target.id === 'lqBusca') { S.cq = e.target.value; draw(); } });
     const mini = document.createElement('style'); mini.textContent = 'html[data-sb="mini"] #lotSwitch{display:none}'; document.head.appendChild(mini);
